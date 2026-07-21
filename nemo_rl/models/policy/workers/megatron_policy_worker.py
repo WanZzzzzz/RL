@@ -38,6 +38,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
 from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
@@ -337,6 +338,9 @@ class MegatronPolicyWorkerImpl(
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
         )
+        self.log_memory_footprint = config["megatron_cfg"].get(
+            "log_memory_footprint", False
+        )
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
@@ -377,6 +381,8 @@ class MegatronPolicyWorkerImpl(
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
         )
+        if self.log_memory_footprint:
+            self._log_memory_footprint("after_model_setup")
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
@@ -657,6 +663,9 @@ class MegatronPolicyWorkerImpl(
 
                     # Memory snapshot before the fwd/bwd: jobs 2269463/2269456
                     # died here (CUDA OOM / ncclUnhandledCudaError at peak).
+                    if self.log_memory_footprint:
+                        torch.cuda.reset_peak_memory_stats()
+                        self._log_memory_footprint("before_train_fwd_bwd")
                     _alloc = torch.cuda.memory_allocated() / (1024**3)
                     _resv = torch.cuda.memory_reserved() / (1024**3)
                     _free, _total = torch.cuda.mem_get_info()
@@ -697,6 +706,9 @@ class MegatronPolicyWorkerImpl(
                             router_replay_train=not eval_mode,
                         )
 
+                    if self.log_memory_footprint:
+                        self._log_memory_footprint("after_train_fwd_bwd")
+
                 # Clear mtp_grad_scale_func after the forward-backward pass so
                 # it doesn't get serialized in the run_config.yaml when saving
                 self._set_mtp_grad_scale_func(None)
@@ -713,6 +725,8 @@ class MegatronPolicyWorkerImpl(
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    if self.log_memory_footprint:
+                        self._log_memory_footprint("after_optimizer_step")
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
 
@@ -1684,6 +1698,110 @@ class MegatronPolicyWorkerImpl(
                         raise ValueError(
                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
                         )
+
+    @staticmethod
+    def _iter_optimizer_tensors(value: Any) -> Iterator[torch.Tensor]:
+        if torch.is_tensor(value):
+            yield value
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from MegatronPolicyWorkerImpl._iter_optimizer_tensors(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from MegatronPolicyWorkerImpl._iter_optimizer_tensors(item)
+
+    @staticmethod
+    def _optimizer_param_tensors(optimizer: torch.optim.Optimizer) -> Iterator[torch.Tensor]:
+        for group in optimizer.param_groups:
+            yield from group["params"]
+
+    def _log_memory_footprint(self, stage: str) -> None:
+        """Log process, CUDA, and optimizer tensor footprints without double-counting aliases."""
+        category_tensors: dict[str, list[torch.Tensor]] = defaultdict(list)
+        optimizers = (
+            self.optimizer.chained_optimizers
+            if isinstance(self.optimizer, ChainedOptimizer)
+            else [self.optimizer]
+        )
+
+        for wrapped_optimizer in optimizers:
+            inner_optimizer = getattr(wrapped_optimizer, "optimizer", None)
+            if inner_optimizer is None:
+                continue
+
+            if isinstance(inner_optimizer, HybridDeviceOptimizer):
+                category_tensors["cpu_shadow_params"].extend(
+                    inner_optimizer.gpu_params_map_cpu_copy.values()
+                )
+                category_tensors["cpu_grad_staging"].extend(
+                    inner_optimizer.cpu_copy_map_grad.values()
+                )
+                for cpu_optimizer in inner_optimizer.cpu_optimizers:
+                    category_tensors["cpu_optimizer_state"].extend(
+                        self._iter_optimizer_tensors(cpu_optimizer.state)
+                    )
+                if inner_optimizer.gpu_optimizer is not None:
+                    category_tensors["gpu_optimizer_params"].extend(
+                        self._optimizer_param_tensors(inner_optimizer.gpu_optimizer)
+                    )
+                    category_tensors["gpu_optimizer_state"].extend(
+                        self._iter_optimizer_tensors(
+                            inner_optimizer.gpu_optimizer.state
+                        )
+                    )
+            else:
+                for tensor in self._optimizer_param_tensors(inner_optimizer):
+                    category_tensors[
+                        "cpu_optimizer_params"
+                        if tensor.device.type == "cpu"
+                        else "gpu_optimizer_params"
+                    ].append(tensor)
+                for tensor in self._iter_optimizer_tensors(inner_optimizer.state):
+                    category_tensors[
+                        "cpu_optimizer_state"
+                        if tensor.device.type == "cpu"
+                        else "gpu_optimizer_state"
+                    ].append(tensor)
+
+        category_bytes = {}
+        for category, tensors in category_tensors.items():
+            seen_storage = set()
+            total_bytes = 0
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                storage_key = (storage.data_ptr(), storage.nbytes(), tensor.device.type)
+                if storage_key in seen_storage:
+                    continue
+                seen_storage.add(storage_key)
+                total_bytes += storage.nbytes()
+            category_bytes[category] = total_bytes
+
+        rss_bytes = 0
+        try:
+            with open("/proc/self/statm") as statm:
+                rss_pages = int(statm.read().split()[1])
+            rss_bytes = rss_pages * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            pass
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        gib = 1024**3
+        optimizer_summary = " ".join(
+            f"{name}={num_bytes / gib:.2f}GiB"
+            for name, num_bytes in sorted(category_bytes.items())
+        )
+        print(
+            f"[memory-footprint] rank={self.rank} stage={stage} "
+            f"host_rss={rss_bytes / gib:.2f}GiB "
+            f"cuda_allocated={torch.cuda.memory_allocated() / gib:.2f}GiB "
+            f"cuda_reserved={torch.cuda.memory_reserved() / gib:.2f}GiB "
+            f"cuda_peak_allocated={torch.cuda.max_memory_allocated() / gib:.2f}GiB "
+            f"cuda_peak_reserved={torch.cuda.max_memory_reserved() / gib:.2f}GiB "
+            f"device_free={free_bytes / gib:.2f}GiB "
+            f"device_total={total_bytes / gib:.2f}GiB "
+            f"{optimizer_summary}",
+            flush=True,
+        )
 
     def save_checkpoint(
         self,
