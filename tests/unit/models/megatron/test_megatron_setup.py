@@ -1081,39 +1081,38 @@ class TestApplyPerformanceConfig:
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 
-    def test_cpu_offload_requires_full_fraction(self):
-        """Test that CPU offload requires offload_fraction=1.0."""
+    @pytest.mark.parametrize("offload_fraction", [0.25, 0.5, 1.0])
+    def test_cpu_offload_accepts_valid_fraction(self, offload_fraction):
+        """Test that CPU offload accepts full and partial offload fractions."""
         from nemo_rl.models.megatron.setup import _validate_optimizer_config
 
         config = {
             "megatron_cfg": {
                 "optimizer": {
                     "optimizer_cpu_offload": True,
-                    "optimizer_offload_fraction": 0.5,
+                    "optimizer_offload_fraction": offload_fraction,
                 }
             }
         }
 
-        with pytest.raises(AssertionError) as exc_info:
-            _validate_optimizer_config(config)
-
-        assert "optimizer_offload_fraction=1.0" in str(exc_info.value)
-
-    def test_cpu_offload_with_full_fraction(self):
-        """Test that CPU offload works with full fraction."""
-        from nemo_rl.models.megatron.setup import _validate_optimizer_config
-
-        config = {
-            "megatron_cfg": {
-                "optimizer": {
-                    "optimizer_cpu_offload": True,
-                    "optimizer_offload_fraction": 1.0,
-                }
-            }
-        }
-
-        # Should not raise
         _validate_optimizer_config(config)
+
+    @pytest.mark.parametrize("offload_fraction", [-0.1, 0.0, 1.1])
+    def test_cpu_offload_rejects_invalid_fraction(self, offload_fraction):
+        """Test that CPU offload rejects fractions outside the valid range."""
+        from nemo_rl.models.megatron.setup import _validate_optimizer_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {
+                    "optimizer_cpu_offload": True,
+                    "optimizer_offload_fraction": offload_fraction,
+                }
+            }
+        }
+
+        with pytest.raises(ValueError, match=r"must be in the range \(0.0, 1.0\]"):
+            _validate_optimizer_config(config)
 
     def test_no_cpu_offload(self):
         """Test configuration without CPU offload."""

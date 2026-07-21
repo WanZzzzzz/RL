@@ -1476,7 +1476,8 @@ class MegatronPolicyWorkerImpl(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
 
-        # offload optimizer to cpu
+        # Phase-offload ordinary GPU optimizers. Megatron's hybrid CPU optimizer
+        # owns the placement of its CPU/GPU partitions and must remain intact.
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             hasattr(self, "optimizer")
@@ -1498,8 +1499,8 @@ class MegatronPolicyWorkerImpl(
         )
         self.model.train()
 
-        # Training expects optimizer state on CUDA. Keep this unconditional rather
-        # than trying to mirror every path that may have offloaded it to CPU.
+        # Restore an ordinary optimizer that NeMo RL phase-offloaded. Megatron's
+        # hybrid optimizer keeps each partition on its configured device.
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
@@ -1616,6 +1617,10 @@ class MegatronPolicyWorkerImpl(
             except Exception:
                 pass
 
+        # Do not move a Megatron hybrid optimizer: replacing tensors in its
+        # aggregate state would desynchronize its CPU/GPU sub-optimizers.
+        # Consequently, a partially offloaded optimizer's GPU partition remains
+        # resident while refitting the generation workers.
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             hasattr(self, "optimizer")

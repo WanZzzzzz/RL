@@ -857,11 +857,15 @@ def _validate_optimizer_config(config: PolicyConfig) -> None:
     ]
 
     if optimizer_cpu_offload:
-        # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
-        # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
-        assert optimizer_offload_fraction == 1.0, (
-            "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
-        )
+        # Megatron's HybridDeviceOptimizer owns the placement and update of both
+        # its CPU and GPU parameter partitions. NeMo RL must leave that placement
+        # intact across training, logprob, and refit phases; the GPU-owned
+        # partition therefore remains resident outside training.
+        if not 0.0 < optimizer_offload_fraction <= 1.0:
+            raise ValueError(
+                "optimizer_offload_fraction must be in the range (0.0, 1.0] when "
+                f"optimizer_cpu_offload is enabled, got {optimizer_offload_fraction}"
+            )
 
 
 def _validate_chunking_config(config: PolicyConfig) -> None:
