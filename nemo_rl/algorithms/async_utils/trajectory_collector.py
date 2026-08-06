@@ -76,6 +76,10 @@ class AsyncTrajectoryCollector:
             k: _threading.Lock() for k in self.teacher_worker_groups
         }
         self.running = False
+        self.data_exhausted = False
+        self.collection_failed = False
+        self.collection_error: Optional[str] = None
+        self._status_lock = _threading.Lock()
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -246,8 +250,40 @@ class AsyncTrajectoryCollector:
 
         print("Collection thread started, start_collection returning")
 
+    def get_status(self) -> dict[str, Any]:
+        """Return collector state for driver-side starvation checks."""
+        with self._threads_lock:
+            inflight_workers = len(self._inflight_threads)
+        with self._status_lock:
+            running = self.running
+            data_exhausted = self.data_exhausted
+            collection_failed = self.collection_failed
+            collection_error = self.collection_error
+        return {
+            "running": running,
+            "data_exhausted": data_exhausted,
+            "errored": collection_failed,
+            "error": collection_error,
+            "inflight_workers": inflight_workers,
+        }
+
+    def _record_collection_failure(self, error: Exception, *, context: str) -> None:
+        """Record the first terminal collector failure and wake paused threads."""
+        with self._status_lock:
+            if not self.collection_failed:
+                self.collection_failed = True
+                self.collection_error = f"{context}: {type(error).__name__}: {error}"
+            self.data_exhausted = False
+            self.running = False
+
+        # The collection thread may be waiting on any one of these conditions.
+        self._manual_pause_cleared.set()
+        self._refit_pause_cleared.set()
+        self._generation_limit_cleared.set()
+
     def _collection_loop(self):
         """Run the collection loop in background thread."""
+        dataloader_exhausted = False
         try:
             for batch in self.dataloader:
                 if not self.running:
@@ -308,15 +344,44 @@ class AsyncTrajectoryCollector:
                     break
 
                 self._process_batch(batch)
+                if not self.running:
+                    break
+            else:
+                dataloader_exhausted = True
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
+            self._record_collection_failure(e, context="collection_loop")
             import traceback
 
             traceback.print_exc()
         finally:
-            self.running = False
-            print("🛑 Trajectory collection stopped")
+            should_drain = False
+            if dataloader_exhausted:
+                with self._status_lock:
+                    should_drain = not self.collection_failed
+                    if should_drain:
+                        # Keep running true while the final prompt workers enqueue
+                        # their valid results. The driver observes exhaustion but
+                        # treats it as terminal only after the workers drain.
+                        self.data_exhausted = True
+                if should_drain:
+                    print(
+                        "⏳ Dataloader exhausted; draining pending generation "
+                        "threads before stopping collection."
+                    )
+                    self.wait_for_pending_generations()
+
+            with self._status_lock:
+                self.running = False
+                exhausted_cleanly = self.data_exhausted and not self.collection_failed
+            if exhausted_cleanly:
+                print(
+                    "❌ Trajectory collection stopped: dataloader exhausted "
+                    "(max_num_epochs reached)."
+                )
+            else:
+                print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
@@ -374,6 +439,9 @@ class AsyncTrajectoryCollector:
                 self._spawning_targets.add(target_weight)
             try:
                 for prompt_idx in range(num_prompts_to_generate):
+                    if not self.running:
+                        break
+
                     # Honor a manual pause (e.g. validation boundary) mid-batch:
                     # without this, a pause landing while the spawn loop is open
                     # lets the remainder of the 256-episode batch launch into
@@ -415,6 +483,9 @@ class AsyncTrajectoryCollector:
                         daemon=True,
                     )
                     self._inflight_sema.acquire()
+                    if not self.running:
+                        self._inflight_sema.release()
+                        break
                     registered = False
                     try:
                         with self._threads_lock:
@@ -470,6 +541,7 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+            raise
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -863,8 +935,16 @@ class AsyncTrajectoryCollector:
                 import traceback
 
                 traceback.print_exc()
+                raise
         except Exception as e:
             print(f"❌ Error in prompt group worker: {e}")
+            self._record_collection_failure(
+                e,
+                context=(
+                    f"prompt_group_worker(prompt_idx={prompt_idx}, "
+                    f"target_weight={target_weight_version})"
+                ),
+            )
             import traceback
 
             traceback.print_exc()

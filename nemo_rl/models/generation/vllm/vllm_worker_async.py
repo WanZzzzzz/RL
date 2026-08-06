@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import warnings
+from collections.abc import Mapping, Set
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -53,6 +54,60 @@ LOGGER = logging.getLogger(__name__)
 _NEMO_RL_REQUEST_TYPE_METADATA_KEY = "_nemo_rl_request_type"
 _NEMO_RL_VALIDATION_REQUEST_TYPE = "validation"
 _NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY = "_validation_generation"
+
+
+def _materialize_message_field(
+    value, *, message_idx: int, role, field: str
+) -> list:
+    """Materialize a deferred message collection without changing its meaning."""
+    if isinstance(value, (Mapping, str, bytes, bytearray, Set)):
+        raise TypeError(
+            f"Unsupported chat message {field} during vLLM preprocessing: "
+            f"message_index={message_idx}, role={role!r}, "
+            f"{field}_type={type(value).__name__}."
+        )
+
+    try:
+        materialized = list(value)
+    except TypeError as exc:
+        raise TypeError(
+            f"Unsupported chat message {field} during vLLM preprocessing: "
+            f"message_index={message_idx}, role={role!r}, "
+            f"{field}_type={type(value).__name__}."
+        ) from exc
+
+    expected_attribute = "type" if field == "content" else "function"
+    for item_idx, item in enumerate(materialized):
+        if not isinstance(item, Mapping) and not hasattr(item, expected_attribute):
+            raise TypeError(
+                f"Unsupported chat message {field} item during vLLM preprocessing: "
+                f"message_index={message_idx}, role={role!r}, "
+                f"item_index={item_idx}, item_type={type(item).__name__}."
+            )
+    return materialized
+
+
+def _materialize_chat_message_collections(messages) -> None:
+    """Materialize vLLM/Pydantic message iterables without semantic coercion."""
+    for message_idx, message in enumerate(messages):
+        role = message.get("role")
+        tool_calls = message.get("tool_calls")
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            message["tool_calls"] = _materialize_message_field(
+                tool_calls,
+                message_idx=message_idx,
+                role=role,
+                field="tool_calls",
+            )
+
+        content = message.get("content")
+        if content is not None and not isinstance(content, (list, str)):
+            message["content"] = _materialize_message_field(
+                content,
+                message_idx=message_idx,
+                role=role,
+                field="content",
+            )
 
 
 def _pop_nemo_rl_request_type(request: Any) -> Optional[str]:
@@ -204,7 +259,8 @@ def _replace_prefix_tokens(
         return template_token_ids
 
     eos_token_id = tokenizer.eos_token_id
-    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+    if eos_token_id is None:
+        raise ValueError("Prefix reconciliation requires a tokenizer EOS token ID.")
 
     model_cut_end = len(model_prefix_token_ids)
     if model_prefix_token_ids:
@@ -228,19 +284,21 @@ def _replace_prefix_tokens(
         )
         if repaired_token_ids is not None:
             return repaired_token_ids
+        if not prefix_is_monotonic:
+            raise ValueError(
+                "Chat-template prefix is non-monotonic and suffix-based prefix "
+                "repair could not establish a safe message boundary: "
+                f"template_prefix_length={len(template_prefix_token_ids)}, "
+                f"template_length={len(template_token_ids)}, "
+                f"suffix_message_count={suffix_message_count}."
+            )
 
-    # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
+    if len(template_token_ids) <= len(template_prefix_token_ids):
+        raise ValueError(
+            "Found a non-increasing chat-template trajectory after prefix repair: "
+            f"template_prefix_length={len(template_prefix_token_ids)}, "
+            f"template_length={len(template_token_ids)}."
+        )
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -249,17 +307,13 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             template_cut_start = pos
             break
 
-    # This should never be the case, but
-    assert (
-        template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
+    if template_cut_start < 0:
+        raise ValueError(
+            "No EOS token ID was found in the chat-template prefix during prefix "
+            f"reconciliation: eos_token_id={eos_token_id}, "
+            f"template_prefix_length={len(template_prefix_token_ids)}, "
+            f"template_length={len(template_token_ids)}."
+        )
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
@@ -671,24 +725,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 *,
                 skip_mm_cache: bool = False,
             ):
-                for message in messages:
-                    if message.get("tool_calls"):
-                        message["tool_calls"] = list(message["tool_calls"])
-
-                    content = message.get("content")
-                    if content is not None and not isinstance(content, (list, str)):
-                        try:
-                            message["content"] = list(content)
-                        except TypeError:
-                            message["content"] = []
-
-                truncate_prompt_tokens = worker_self.cfg.get("truncate_prompt_tokens")
-                if (
-                    truncate_prompt_tokens is not None
-                    and hasattr(request, "truncate_prompt_tokens")
-                    and request.truncate_prompt_tokens is None
-                ):
-                    request.truncate_prompt_tokens = truncate_prompt_tokens
+                _materialize_chat_message_collections(messages)
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.

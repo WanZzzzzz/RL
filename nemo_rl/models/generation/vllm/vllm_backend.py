@@ -24,6 +24,7 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
+from nemo_rl.utils.cuda_memory_profiler import CudaMemoryPhaseProfiler
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
@@ -92,6 +93,20 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    def _cuda_memory_profiler(self) -> CudaMemoryPhaseProfiler:
+        profiler = getattr(self, "_nrl_cuda_memory_profiler", None)
+        if profiler is None:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            profiler = CudaMemoryPhaseProfiler(
+                role="vllm-generation", rank=rank, env_prefix="VLLM"
+            )
+            self._nrl_cuda_memory_profiler = profiler
+        return profiler
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -446,6 +461,9 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
+        memory_profiler = self._cuda_memory_profiler()
+        memory_profiler.stop("generation")
+        memory_profiler.start("refit")
         load_model_weight_func = self._load_weights
 
         try:
@@ -456,6 +474,17 @@ class VllmInternalWorkerExtension:
                 post_unpack_func=load_model_weight_func,
             )
 
+            # Process weights after loading
+            from vllm.config import set_current_vllm_config
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                process_weights_after_loading(
+                    self.model_runner.model, self.model_config, self.device
+                )
+
             # Process weights after loading for FP8 KV cache
             self._maybe_process_fp8_kv_cache()
 
@@ -465,7 +494,12 @@ class VllmInternalWorkerExtension:
                 f"{traceback.format_exc()}"
             )
             return False
+        finally:
+            memory_profiler.stop("refit")
 
+        # Disaggregated generation remains resident and runs until the next
+        # weight update, so the interval between refits is its natural phase.
+        memory_profiler.start("generation")
         return True
 
     def cleanup(self) -> None:

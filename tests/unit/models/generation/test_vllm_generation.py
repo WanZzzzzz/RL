@@ -41,6 +41,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _materialize_chat_message_collections,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
@@ -1850,6 +1851,67 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
     assert result == template_token_ids
 
 
+def test_materialize_chat_message_collections_preserves_iterable_content():
+    messages = [
+        {
+            "role": "assistant",
+            "content": iter([{"type": "text", "text": "answer"}]),
+            "tool_calls": iter([{"name": "tool"}]),
+        }
+    ]
+
+    _materialize_chat_message_collections(messages)
+
+    assert messages[0]["content"] == [{"type": "text", "text": "answer"}]
+    assert messages[0]["tool_calls"] == [{"name": "tool"}]
+
+
+def test_materialize_chat_message_collections_rejects_unsupported_content():
+    messages = [{"role": "tool", "content": 17}]
+
+    with pytest.raises(
+        TypeError,
+        match="message_index=0, role='tool', content_type=int",
+    ):
+        _materialize_chat_message_collections(messages)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"type": "text", "text": "answer"},
+        b"answer",
+        {"answer"},
+    ],
+    ids=["mapping", "bytes", "set"],
+)
+def test_materialize_chat_message_collections_rejects_ambiguous_iterables(content):
+    messages = [{"role": "assistant", "content": content}]
+
+    with pytest.raises(TypeError, match=f"content_type={type(content).__name__}"):
+        _materialize_chat_message_collections(messages)
+
+
+def test_materialize_chat_message_collections_rejects_invalid_deferred_item():
+    messages = [{"role": "assistant", "content": iter([17])}]
+
+    with pytest.raises(TypeError, match="item_index=0, item_type=int"):
+        _materialize_chat_message_collections(messages)
+
+
+def test_materialize_chat_message_collections_rejects_tool_call_mapping():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "tool_calls": {"name": "tool"},
+        }
+    ]
+
+    with pytest.raises(TypeError, match="tool_calls_type=dict"):
+        _materialize_chat_message_collections(messages)
+
+
 def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     class _T:
         eos_token_id = 2
@@ -1861,7 +1923,7 @@ def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     model_prefix_token_ids = [7, 2]
     template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
     template_token_ids = [9, 9, 9, 2, 10]
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="No EOS token ID"):
         _replace_prefix_tokens(
             tokenizer=tokenizer,
             model_prefix_token_ids=model_prefix_token_ids,
@@ -1875,7 +1937,7 @@ def test_replace_prefix_tokens_tokenizer_without_eos_raises():
         eos_token_id = None
 
     tokenizer = _T()
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="requires a tokenizer EOS token ID"):
         _replace_prefix_tokens(
             tokenizer=tokenizer,
             model_prefix_token_ids=[1],
@@ -1926,12 +1988,25 @@ def test_replace_prefix_tokens_keeps_strict_failure_without_suffix_context():
         def decode(self, token_ids):
             return str(token_ids)
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="non-monotonic"):
         _replace_prefix_tokens(
             tokenizer=_T(),
             model_prefix_token_ids=[10, 11, 2],
             template_prefix_token_ids=[10, 99, 2],
             template_token_ids=[10, 11, 2],
+        )
+
+
+def test_replace_prefix_tokens_rejects_longer_non_monotonic_template():
+    class _T:
+        eos_token_id = 2
+
+    with pytest.raises(ValueError, match="non-monotonic"):
+        _replace_prefix_tokens(
+            tokenizer=_T(),
+            model_prefix_token_ids=[10, 11, 2],
+            template_prefix_token_ids=[10, 99, 2],
+            template_token_ids=[10, 11, 2, 20],
         )
 
 

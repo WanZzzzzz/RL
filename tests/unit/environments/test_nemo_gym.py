@@ -226,11 +226,8 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
 
 
-def test_nemo_gym_postprocess_empty_generation_is_masked_zero_reward():
+def test_nemo_gym_postprocess_empty_generation_raises():
     class _Tokenizer:
-        pad_token_id = 7
-        eos_token_id = 8
-
         def apply_chat_template(self, messages, tokenize=True):
             return [1, 2, 3]
 
@@ -243,22 +240,13 @@ def test_nemo_gym_postprocess_empty_generation_is_masked_zero_reward():
         "reward": 1.0,
     }
 
-    mock_self = _MockSelf()
-    zero_reward = NemoGym.__ray_metadata__.modified_class._zero_reward_nemo_rl_result
-    mock_self._zero_reward_nemo_rl_result = MethodType(zero_reward, mock_self)
-    result = (
+    with pytest.raises(ValueError, match="no generation data"):
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            mock_self, nemo_gym_result, _Tokenizer()
+            _MockSelf(), nemo_gym_result, _Tokenizer()
         )
-    )
-
-    assert result["full_result"]["reward"] == 0.0
-    assert result["message_log"][0]["token_ids"].tolist() == [7, 7]
-    assert result["message_log"][1]["token_ids"].tolist() == [7]
-    assert "generation_logprobs" not in result["message_log"][1]
 
 
-def test_nemo_gym_transport_failure_preserves_batch_shape():
+def test_nemo_gym_transport_failure_propagates():
     async def failed_rollout():
         raise ClientConnectionError("transient failure")
 
@@ -266,41 +254,24 @@ def test_nemo_gym_transport_failure_preserves_batch_shape():
         def run_examples(self, examples, head_server_config):
             return [failed_rollout()]
 
-    class _Tokenizer:
-        pad_token_id = 7
-        eos_token_id = 8
-
     class _MockSelf:
         cfg = {}
         rollout_max_attempts_to_avoid_lp_nan = 1
         rch = _RolloutCollectionHelper()
         head_server_config = object()
 
-    mock_self = _MockSelf()
-    postprocess = (
-        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
-    )
-    mock_self._postprocess_nemo_gym_to_nemo_rl_result = MethodType(
-        postprocess, mock_self
-    )
-    zero_reward = NemoGym.__ray_metadata__.modified_class._zero_reward_nemo_rl_result
-    mock_self._zero_reward_nemo_rl_result = MethodType(zero_reward, mock_self)
-
-    results, _ = asyncio.run(
-        NemoGym.__ray_metadata__.modified_class.run_rollouts(
-            mock_self,
-            [{"_rowidx": 0}],
-            _Tokenizer(),
-            "timing/rollout",
+    with pytest.raises(ClientConnectionError, match="transient failure"):
+        asyncio.run(
+            NemoGym.__ray_metadata__.modified_class.run_rollouts(
+                _MockSelf(),
+                [{"_rowidx": 0}],
+                object(),
+                "timing/rollout",
+            )
         )
-    )
-
-    assert len(results) == 1
-    assert results[0]["full_result"]["reward"] == 0.0
-    assert results[0]["full_result"]["nemo_rl_fallback_reason"] == "rollout_failed"
 
 
-def test_nemo_gym_postprocess_failure_preserves_batch_shape():
+def test_nemo_gym_postprocess_failure_propagates():
     async def malformed_rollout():
         return (
             {"_rowidx": 0},
@@ -321,10 +292,6 @@ def test_nemo_gym_postprocess_failure_preserves_batch_shape():
         def run_examples(self, examples, head_server_config):
             return [malformed_rollout()]
 
-    class _Tokenizer:
-        pad_token_id = 7
-        eos_token_id = 8
-
     class _MockSelf:
         cfg = {}
         rollout_max_attempts_to_avoid_lp_nan = 1
@@ -336,50 +303,76 @@ def test_nemo_gym_postprocess_failure_preserves_batch_shape():
     mock_self._postprocess_nemo_gym_to_nemo_rl_result = MethodType(
         modified_class._postprocess_nemo_gym_to_nemo_rl_result, mock_self
     )
-    mock_self._zero_reward_nemo_rl_result = MethodType(
-        modified_class._zero_reward_nemo_rl_result, mock_self
-    )
-
-    results, _ = asyncio.run(
-        modified_class.run_rollouts(
-            mock_self,
-            [{"_rowidx": 0}],
-            _Tokenizer(),
-            "timing/rollout",
+    with pytest.raises(ValueError, match="missing required fields.*prompt_token_ids"):
+        asyncio.run(
+            modified_class.run_rollouts(
+                mock_self,
+                [{"_rowidx": 0}],
+                object(),
+                "timing/rollout",
+            )
         )
-    )
-
-    assert len(results) == 1
-    assert results[0]["full_result"]["reward"] == 0.0
-    assert results[0]["full_result"]["nemo_rl_fallback_reason"].startswith(
-        "postprocess_failed:KeyError"
-    )
 
 
-def test_nemo_gym_malformed_response_is_masked_zero_reward():
-    class _Tokenizer:
-        pad_token_id = 7
-        eos_token_id = 8
-
+def test_nemo_gym_malformed_response_raises():
     class _MockSelf:
         cfg = {}
 
-    mock_self = _MockSelf()
     modified_class = NemoGym.__ray_metadata__.modified_class
-    mock_self._zero_reward_nemo_rl_result = MethodType(
-        modified_class._zero_reward_nemo_rl_result, mock_self
-    )
+    with pytest.raises(ValueError, match="malformed response.output"):
+        modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            {"response": {"output": None}, "reward": 1.0},
+            object(),
+        )
 
-    result = modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-        mock_self,
-        {"response": {"output": None}, "reward": 1.0},
-        _Tokenizer(),
-    )
 
-    assert result["full_result"]["reward"] == 0.0
-    assert result["full_result"]["nemo_rl_fallback_reason"] == (
-        "malformed_response_output:NoneType"
-    )
+def test_nemo_gym_missing_rollout_row_raises():
+    class _RolloutCollectionHelper:
+        def run_examples(self, examples, head_server_config):
+            return []
+
+    class _MockSelf:
+        rollout_max_attempts_to_avoid_lp_nan = 1
+        rch = _RolloutCollectionHelper()
+        head_server_config = object()
+
+    with pytest.raises(RuntimeError, match=r"missing _rowidx values: \[0\]"):
+        asyncio.run(
+            NemoGym.__ray_metadata__.modified_class.run_rollouts(
+                _MockSelf(),
+                [{"_rowidx": 0}],
+                object(),
+                "timing/rollout",
+            )
+        )
+
+
+def test_nemo_gym_non_contiguous_tokens_raise():
+    class _MockSelf:
+        cfg = {}
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [1, 2, 99, 4],
+                    "generation_token_ids": [5],
+                    "generation_log_probs": [-0.2],
+                },
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match="non-contiguous.*first_mismatch=2"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, object()
+        )
 
 
 @pytest.mark.nemo_gym

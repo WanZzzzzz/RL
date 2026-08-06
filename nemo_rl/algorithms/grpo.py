@@ -183,6 +183,8 @@ class GRPOConfig(TypedDict):
     advantage_clip_high: NotRequired[float | None]
     use_leave_one_out_baseline: bool
     val_period: int
+    # Skip periodic validation steps before this step. Defaults to 0 when omitted.
+    val_start_at: NotRequired[int]
     val_batch_size: int | None  # None for NeMo-Gym compatibility
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
@@ -190,6 +192,8 @@ class GRPOConfig(TypedDict):
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
     validation_generation: NotRequired[ValidationGenerationConfig | None]
+    # Number of independent validation rollouts generated for each prompt.
+    num_val_generations_per_prompt: NotRequired[int]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -1455,13 +1459,21 @@ def _stable_group_ids(prompt_ids_for_adv, num_generations_per_prompt):
     becomes its own singleton group -> leave-one-out baseline == reward -> advantage == 0 -> zero
     gradient; Exp 26). The training batch is laid out as contiguous num_gen blocks per prompt
     (async: BatchedDataDict.from_batches of per-prompt groups; sync: repeat_interleave), so the
-    correct, model-agnostic group id is positional: index // num_gen. Falls back to the original
-    token-id grouping if the batch is not an exact multiple of num_gen (e.g. dynamic sampling).
+    correct, model-agnostic group id is positional: index // num_gen. An invalid
+    layout is a correctness error: silently falling back to token IDs can turn
+    each completion into a singleton group with zero advantage.
     """
     n = int(prompt_ids_for_adv.shape[0])
     g = int(num_generations_per_prompt)
-    if g <= 0 or n % g != 0:
-        return prompt_ids_for_adv
+    if g <= 0:
+        raise ValueError(
+            f"num_generations_per_prompt must be positive for Gym grouping, got {g}."
+        )
+    if n % g != 0:
+        raise ValueError(
+            "Gym rollout batch size must be divisible by "
+            f"num_generations_per_prompt: batch_size={n}, generations={g}."
+        )
     return (torch.arange(n, device=prompt_ids_for_adv.device) // g).unsqueeze(1)
 
 
@@ -2258,6 +2270,7 @@ def grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo.get("val_start_at", 0)
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
@@ -2859,7 +2872,11 @@ def grpo_train(
                     )
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                if (
+                    val_period > 0
+                    and total_steps + 1 >= val_start_at
+                    and (total_steps + 1) % val_period == 0
+                ) or (
                     val_at_end and is_last_step
                 ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
@@ -3272,6 +3289,37 @@ def grpo_train(
         mlperf_logger.finalize()
 
 
+def _calculate_observed_pass_metrics(
+    total_rewards: list[float], num_generations_per_prompt: int
+) -> dict[str, float]:
+    """Calculate observed pass metrics from prompt-grouped validation rewards."""
+    if num_generations_per_prompt < 1:
+        raise ValueError("grpo.num_val_generations_per_prompt must be >= 1")
+
+    metric_names = (
+        f"pass@{num_generations_per_prompt}",
+        f"pass^{num_generations_per_prompt}",
+        f"pass@1[avg-of-{num_generations_per_prompt}]",
+    )
+    if not total_rewards:
+        return dict.fromkeys(metric_names, 0.0)
+
+    rewards = torch.tensor(total_rewards, dtype=torch.float32)
+    if rewards.numel() % num_generations_per_prompt != 0:
+        raise ValueError(
+            "Validation reward count must be divisible by "
+            "grpo.num_val_generations_per_prompt: "
+            f"reward_count={rewards.numel()}, "
+            f"generations={num_generations_per_prompt}."
+        )
+    passed = rewards.view(-1, num_generations_per_prompt) > 0
+    return {
+        metric_names[0]: passed.any(dim=1).float().mean().item(),
+        metric_names[1]: passed.all(dim=1).float().mean().item(),
+        metric_names[2]: passed.float().mean().item(),
+    }
+
+
 def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
@@ -3292,10 +3340,16 @@ def validate(
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
+        num_val_generations_per_prompt = int(
+            master_config.grpo.get("num_val_generations_per_prompt", 1)
+        )
+        if num_val_generations_per_prompt < 1:
+            raise ValueError("grpo.num_val_generations_per_prompt must be >= 1")
 
         total_rewards = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
+        additional_metrics_to_report = dict()
 
         max_batches = (
             master_config.grpo["max_val_samples"]
@@ -3322,7 +3376,9 @@ def validate(
             if batch_idx >= max_batches:
                 break
 
-            additional_metrics_to_report = dict()
+            if num_val_generations_per_prompt > 1:
+                val_batch = val_batch.repeat_interleave(num_val_generations_per_prompt)
+
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
@@ -3377,9 +3433,19 @@ def validate(
 
             all_message_logs.extend(to_env)
 
-        # Calculate validation metrics
+        # For grouped validation, pass@k is the benchmark accuracy and MLPerf
+        # convergence metric. Retain pass^k and average pass@1 as diagnostics.
         num_samples = len(total_rewards)
-        if num_samples > 0:
+        observed_pass_metrics: dict[str, float] = {}
+        if num_val_generations_per_prompt > 1:
+            observed_pass_metrics = _calculate_observed_pass_metrics(
+                total_rewards,
+                num_val_generations_per_prompt,
+            )
+            accuracy = observed_pass_metrics[
+                f"pass@{num_val_generations_per_prompt}"
+            ]
+        elif num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
             accuracy = rewards_t.mean().item()
         else:
@@ -3392,8 +3458,9 @@ def validate(
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
-            **additional_metrics_to_report,
+            **observed_pass_metrics,
         }
+        val_metrics.update(additional_metrics_to_report)
 
         # Print sample conversations only once at the end of validation
         try:
@@ -3416,7 +3483,15 @@ def validate(
 
     # Print summary of validation results
     print("\n📊 Validation Results:")
-    print(f"    • Accuracy: {accuracy:.4f}")
+    if num_val_generations_per_prompt > 1:
+        for metric_name in (
+            f"pass@{num_val_generations_per_prompt}",
+            f"pass^{num_val_generations_per_prompt}",
+            f"pass@1[avg-of-{num_val_generations_per_prompt}]",
+        ):
+            print(f"    • {metric_name}: {val_metrics[metric_name]:.4f}")
+    else:
+        print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
@@ -3567,6 +3642,7 @@ def async_grpo_train(
         "total_valid_tokens", 0
     )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo.get("val_start_at", 0)
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
@@ -3767,25 +3843,24 @@ def async_grpo_train(
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             print("✅ Initial validation completed successfully")
         except Exception as e:
+            initial_validation_error = e
             if mlperf_logger is not None:
                 # end_eval_with_error emits the terminal RUN_STOP; continuing to
                 # train would append events after it and could never log SUCCESS,
                 # so fail fast instead of treating validation as optional. The
                 # raise happens below, after actor cleanup.
                 mlperf_logger.end_eval_with_error(0)
-                initial_validation_error = e
             else:
                 print(f"❌ Initial validation failed: {e}")
                 import traceback
 
                 traceback.print_exc()
-                # Continue anyway since validation is optional
         finally:
             # Resume trajectory collection after initial validation
             trajectory_collector.resume.remote()
 
-        if mlperf_logger is not None and (
-            mlperf_logger.target_reached or initial_validation_error is not None
+        if initial_validation_error is not None or (
+            mlperf_logger is not None and mlperf_logger.target_reached
         ):
             try:
                 ray.kill(trajectory_collector)
@@ -3804,45 +3879,75 @@ def async_grpo_train(
     if policy_generation is not None:
         policy_generation.clear_logger_metrics()
 
-    # Wait for initial buffer fill for the current training step.
-    print(
-        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
-    )
-    wait_iterations = 0
-    while True:
-        buffer_size_current = ray.get(replay_buffer.size.remote())
-        current_step_ready = ray.get(
-            replay_buffer.has_complete_batch.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
+    def _raise_if_trajectory_collector_stopped(
+        context: str, *, check_exhaustion: bool = True
+    ) -> None:
+        collector_status = ray.get(trajectory_collector.get_status.remote())
+        terminal = (
+            not collector_status["running"]
+            and collector_status["inflight_workers"] == 0
+        )
+        if collector_status.get("errored", False):
+            raise RuntimeError(
+                f"Trajectory collector failed {context}: "
+                f"{collector_status.get('error') or '<no error detail>'}. "
+                f"Collector status: {collector_status}."
             )
-        )
-
-        print(
-            f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-            f"step {step} ready={current_step_ready}"
-        )
-
-        if current_step_ready:
-            break
-
-        trajectories_needed = ray.get(
-            replay_buffer.get_trajectories_needed.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
-            )
-        )
-        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
-            print(
-                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
-                f"trajectories for step {step}"
+        if check_exhaustion and terminal and collector_status["data_exhausted"]:
+            raise RuntimeError(
+                f"Trajectory collector exhausted its dataloader {context}. "
+                "Increase data.train.max_num_epochs or use a larger dataset. "
+                f"Collector status: {collector_status}."
             )
 
-        wait_iterations += 1
-        time.sleep(1.0)
-
-    print(f"✅ Buffer ready for step {step}! Starting training loop...")
-
-    # Main training loop
     try:
+        # Wait for initial buffer fill for the current training step. Keep this
+        # inside the training cleanup scope so collector failures cannot leak
+        # Ray actors while propagating to the launcher.
+        print(
+            f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
+        )
+        wait_iterations = 0
+        while True:
+            buffer_size_current = ray.get(replay_buffer.size.remote())
+            current_step_ready = ray.get(
+                replay_buffer.has_complete_batch.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
+            )
+
+            print(
+                f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
+                f"step {step} ready={current_step_ready}"
+            )
+
+            _raise_if_trajectory_collector_stopped(
+                f"during initial buffer fill at step={step}",
+                check_exhaustion=not current_step_ready,
+            )
+            if current_step_ready:
+                break
+
+            trajectories_needed = ray.get(
+                replay_buffer.get_trajectories_needed.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
+            )
+            if (
+                buffer_size_current >= min_trajectories_needed
+                and trajectories_needed > 0
+            ):
+                print(
+                    f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
+                    f"trajectories for step {step}"
+                )
+
+            wait_iterations += 1
+            time.sleep(1.0)
+
+        print(f"✅ Buffer ready for step {step}! Starting training loop...")
+
+        # Main training loop
         while step < master_config.grpo["max_num_steps"]:
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config.grpo['max_num_steps']} {'=' * 25}"
@@ -3850,6 +3955,10 @@ def async_grpo_train(
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
+
+            _raise_if_trajectory_collector_stopped(
+                f"before training_step={step}", check_exhaustion=False
+            )
 
             with timer.time("total_step_time"):
                 # Sample trajectories from replay buffer
@@ -3895,6 +4004,9 @@ def async_grpo_train(
                                 f"   Trajectory versions in buffer: {buffer_debug['trajectory_versions']}"
                             )
 
+                        _raise_if_trajectory_collector_stopped(
+                            f"while waiting for trajectories at training_step={step}"
+                        )
                         time.sleep(0.5)
                         continue
 
@@ -3932,11 +4044,11 @@ def async_grpo_train(
                     * master_config.grpo["num_generations_per_prompt"]
                 )
                 if repeated_batch.size != expected_batch_size:
-                    print(
-                        f"❌ Unexpected training batch size: got {repeated_batch.size}, expected {expected_batch_size}. Skipping step and waiting for correct buffer content."
+                    raise RuntimeError(
+                        "Unexpected async GRPO training batch size: "
+                        f"got {repeated_batch.size}, expected {expected_batch_size}. "
+                        "Refusing to continue with an invalid prompt-group layout."
                     )
-                    time.sleep(0.5)
-                    continue
 
                 # Optional sanity: ensure DP divisibility to avoid sharding issues
                 dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
@@ -4213,7 +4325,11 @@ def async_grpo_train(
                 is_last_step = step + 1 == master_config.grpo["max_num_steps"]
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (step + 1) % val_period == 0) or (
+                if (
+                    val_period > 0
+                    and step + 1 >= val_start_at
+                    and (step + 1) % val_period == 0
+                ) or (
                     val_at_end and is_last_step
                 ):
                     # Pause trajectory collection during validation to reduce memory pressure
@@ -4560,6 +4676,7 @@ def async_grpo_train(
         import traceback
 
         traceback.print_exc()
+        raise
 
     finally:
         if mlperf_logger is not None:

@@ -1121,9 +1121,129 @@ class TestAsyncTrajectoryCollector:
             start_step=0,
         )
 
+    def _prime_collection_loop(self, collector):
+        """Unblock every wait event so the local collection loop can finish."""
+        for attr in (
+            "_manual_pause_cleared",
+            "_refit_pause_cleared",
+            "_generation_limit_cleared",
+        ):
+            event = threading.Event()
+            event.set()
+            setattr(collector, attr, event)
+        collector._should_pause_for_generation_limits = lambda: False
+        collector.running = True
+
+    def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = [{"batch": 0}, {"batch": 1}]
+
+        collector._collection_loop()
+
+        assert processed == [{"batch": 0}, {"batch": 1}]
+        assert collector.get_status() == {
+            "running": False,
+            "data_exhausted": True,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 0,
+        }
+
+    def test_collection_loop_drains_workers_while_running_on_exhaustion(self):
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        observed_status = []
+
+        def _observe_drain():
+            observed_status.append(collector.get_status())
+
+        collector.wait_for_pending_generations = _observe_drain
+        collector.dataloader = []
+
+        collector._collection_loop()
+
+        assert observed_status == [
+            {
+                "running": True,
+                "data_exhausted": True,
+                "errored": False,
+                "error": None,
+                "inflight_workers": 0,
+            }
+        ]
+        assert collector.running is False
+
+    def test_collection_loop_records_outer_failure(self):
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+
+        def _fail(_batch):
+            raise RuntimeError("collection blew up")
+
+        collector._process_batch = _fail
+        collector.dataloader = [{"batch": 0}]
+
+        collector._collection_loop()
+
+        status = collector.get_status()
+        assert status["running"] is False
+        assert status["data_exhausted"] is False
+        assert status["errored"] is True
+        assert status["error"] == "collection_loop: RuntimeError: collection blew up"
+
+    def test_collection_loop_manual_stop_is_not_exhaustion(self):
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+
+        def _stop(_batch):
+            collector.running = False
+
+        collector._process_batch = _stop
+        collector.dataloader = [{"batch": 0}, {"batch": 1}]
+
+        collector._collection_loop()
+
+        status = collector.get_status()
+        assert status["running"] is False
+        assert status["data_exhausted"] is False
+        assert status["errored"] is False
+
+    def test_prompt_group_worker_records_failure(self, monkeypatch):
+        collector = self.create_local_collector()
+        collector.running = True
+
+        def _fail_rollout(**_kwargs):
+            raise ValueError("parser broke")
+
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout",
+            _fail_rollout,
+        )
+
+        collector._run_prompt_group_worker(
+            self.create_mock_batch(size=1),
+            generation_weight_version=0,
+            target_weight_version=1,
+            prompt_idx=0,
+        )
+
+        status = collector.get_status()
+        assert status["running"] is False
+        assert status["errored"] is True
+        assert "prompt_group_worker" in status["error"]
+        assert "ValueError: parser broke" in status["error"]
+        assert collector._manual_pause_cleared.is_set()
+        assert collector._refit_pause_cleared.is_set()
+        assert collector._generation_limit_cleared.is_set()
+
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
         config = {
+            "env": {},
             "grpo": {
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,

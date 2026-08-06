@@ -27,6 +27,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
+    _calculate_observed_pass_metrics,
     _apply_configured_message_level_advantage_penalties,
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
@@ -85,12 +86,49 @@ def test_stable_group_ids_uses_contiguous_prompt_groups():
     assert torch.equal(result, torch.tensor([[0], [0], [1], [1]]))
 
 
-def test_stable_group_ids_falls_back_for_incomplete_group():
+def test_stable_group_ids_rejects_incomplete_group():
     rendered_prompt_ids = torch.tensor([[10], [11], [20]])
 
-    result = _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt=2)
+    with pytest.raises(ValueError, match="batch size must be divisible"):
+        _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt=2)
 
-    assert result is rendered_prompt_ids
+
+@pytest.mark.parametrize("num_generations_per_prompt", [0, -1])
+def test_stable_group_ids_rejects_non_positive_generation_count(
+    num_generations_per_prompt,
+):
+    rendered_prompt_ids = torch.tensor([[10], [11]])
+
+    with pytest.raises(ValueError, match="must be positive"):
+        _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt)
+
+
+def test_calculate_observed_pass_metrics_preserves_prompt_groups():
+    metrics = _calculate_observed_pass_metrics(
+        [1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        num_generations_per_prompt=4,
+    )
+
+    assert metrics == pytest.approx(
+        {
+            "pass@4": 1.0,
+            "pass^4": 0.5,
+            "pass@1[avg-of-4]": 0.625,
+        }
+    )
+
+
+@pytest.mark.parametrize("num_generations_per_prompt", [0, -1])
+def test_calculate_observed_pass_metrics_rejects_non_positive_group_size(
+    num_generations_per_prompt,
+):
+    with pytest.raises(ValueError, match="must be >= 1"):
+        _calculate_observed_pass_metrics([], num_generations_per_prompt)
+
+
+def test_calculate_observed_pass_metrics_rejects_incomplete_group():
+    with pytest.raises(ValueError, match="reward_count=3, generations=2"):
+        _calculate_observed_pass_metrics([1.0, 0.0, 1.0], 2)
 
 
 @pytest.fixture
@@ -270,6 +308,21 @@ def mock_grpo_components():
         "val_task_to_env": val_task_to_env,
         "master_config": master_config,
     }
+
+
+def test_validate_rejects_non_positive_generation_group_size(mock_grpo_components):
+    config = mock_grpo_components["master_config"]
+    config.grpo["num_val_generations_per_prompt"] = 0
+
+    with pytest.raises(ValueError, match="must be >= 1"):
+        validate(
+            MagicMock(),
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["val_task_to_env"],
+            step=0,
+            master_config=config,
+        )
 
 
 def _mock_seq_logprob_error_result() -> dict[str, object]:
@@ -692,6 +745,21 @@ class StubAsyncTrajectoryCollector:
 
     Each method is a property that returns a MagicMock with a 'remote' attribute.
     """
+
+    @property
+    def get_status(self):
+        """Return a healthy collector status for buffer-wait tests."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "running": True,
+                "data_exhausted": False,
+                "errored": False,
+                "error": None,
+                "inflight_workers": 0,
+            }
+        )
+        return mock
 
     @property
     def start_collection(self):

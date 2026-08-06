@@ -89,6 +89,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.utils.cuda_memory_profiler import CudaMemoryPhaseProfiler
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -336,6 +337,9 @@ class MegatronPolicyWorkerImpl(
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
+        )
+        self.cuda_memory_profiler = CudaMemoryPhaseProfiler(
+            role="megatron-policy", rank=self.rank
         )
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
@@ -827,6 +831,8 @@ class MegatronPolicyWorkerImpl(
         # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
         # pull an unpicklable torch ConfigModuleInstance into the worker actor).
         self._collect_mtp_metrics(metrics)
+        if not eval_mode:
+            self.cuda_memory_profiler.stop("training")
         return metrics
 
     def _compute_moe_grad_scale(self, global_valid_toks):
@@ -1413,19 +1419,24 @@ class MegatronPolicyWorkerImpl(
             self._refit_expert_shapes_logged = True
 
         # param_iterator will return (name, tensor), we only need tensor.
-        packed_broadcast_producer(
-            iterator=_log_expert_shapes_once(
-                self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
-            ),
-            group=self.model_update_group,
-            src=0,
-            post_iter_func=lambda x: x[1],
-        )
+        self.cuda_memory_profiler.start("refit")
+        try:
+            packed_broadcast_producer(
+                iterator=_log_expert_shapes_once(
+                    self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+                ),
+                group=self.model_update_group,
+                src=0,
+                post_iter_func=lambda x: x[1],
+            )
+        finally:
+            self.cuda_memory_profiler.stop("refit")
 
     def _use_real_quant_refit(self) -> bool:
         return False
 
     def prepare_for_lp_inference(self):
+        self.cuda_memory_profiler.start("logprob")
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
@@ -1448,6 +1459,8 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.empty_cache()
 
     def prepare_for_training(self, *args, **kwargs):
+        self.cuda_memory_profiler.stop("logprob")
+        self.cuda_memory_profiler.start("training")
         # onload models and optimizer state to cuda
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
