@@ -678,28 +678,32 @@ class MegatronPolicyWorkerImpl(
                         stage="train",
                         require=True,
                     )
-                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
-                        losses_reduced = megatron_forward_backward(
-                            model=self.model,
-                            data_iterator=data_iterator,
-                            num_microbatches=num_microbatches,
-                            seq_length=padded_seq_length,
-                            mbs=micro_batch_size,
-                            post_processing_fn=loss_post_processor,
-                            forward_only=eval_mode,
-                            defer_fp32_logits=self.defer_fp32_logits,
-                            global_valid_seqs=global_valid_seqs,
-                            global_valid_toks=global_valid_toks,
-                            sampling_params=self.sampling_params,
-                            straggler_timer=self.mcore_state.straggler_timer,
-                            draft_model=self.draft_model,
-                            enable_hidden_capture=draft_enabled,
-                            use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
-                                "use_linear_ce_fusion_loss", False
-                            ),
-                            use_router_replay=use_router_replay,
-                            router_replay_train=not eval_mode,
-                        )
+                    try:
+                        with maybe_r3_trace_stage("train", enabled=use_router_replay):
+                            losses_reduced = megatron_forward_backward(
+                                model=self.model,
+                                data_iterator=data_iterator,
+                                num_microbatches=num_microbatches,
+                                seq_length=padded_seq_length,
+                                mbs=micro_batch_size,
+                                post_processing_fn=loss_post_processor,
+                                forward_only=eval_mode,
+                                defer_fp32_logits=self.defer_fp32_logits,
+                                global_valid_seqs=global_valid_seqs,
+                                global_valid_toks=global_valid_toks,
+                                sampling_params=self.sampling_params,
+                                straggler_timer=self.mcore_state.straggler_timer,
+                                draft_model=self.draft_model,
+                                enable_hidden_capture=draft_enabled,
+                                use_linear_ce_fusion_loss=self.cfg[
+                                    "megatron_cfg"
+                                ].get("use_linear_ce_fusion_loss", False),
+                                use_router_replay=use_router_replay,
+                                router_replay_train=not eval_mode,
+                            )
+                    except BaseException:
+                        self.cuda_memory_profiler.dump_whole_run("training-error")
+                        raise
 
                 # Clear mtp_grad_scale_func after the forward-backward pass so
                 # it doesn't get serialized in the run_config.yaml when saving
