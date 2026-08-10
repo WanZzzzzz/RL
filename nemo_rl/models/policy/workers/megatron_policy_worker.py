@@ -678,6 +678,9 @@ class MegatronPolicyWorkerImpl(
                         stage="train",
                         require=True,
                     )
+                    torch.cuda.synchronize()
+                    _fwd_bwd_start_alloc = torch.cuda.memory_allocated()
+                    torch.cuda.reset_peak_memory_stats()
                     try:
                         with maybe_r3_trace_stage("train", enabled=use_router_replay):
                             losses_reduced = megatron_forward_backward(
@@ -701,7 +704,28 @@ class MegatronPolicyWorkerImpl(
                                 use_router_replay=use_router_replay,
                                 router_replay_train=not eval_mode,
                             )
+                        torch.cuda.synchronize()
+                        _fwd_bwd_end_alloc = torch.cuda.memory_allocated()
+                        _fwd_bwd_peak_alloc = torch.cuda.max_memory_allocated()
+                        print(
+                            f"[mem-debug] rank={self.rank} after train fwd/bwd: "
+                            f"allocated={_fwd_bwd_end_alloc / (1024**3):.1f}GiB "
+                            f"peak_allocated={_fwd_bwd_peak_alloc / (1024**3):.1f}GiB "
+                            f"transient_peak="
+                            f"{(_fwd_bwd_peak_alloc - _fwd_bwd_start_alloc) / (1024**3):.1f}GiB",
+                            flush=True,
+                        )
                     except BaseException:
+                        _fwd_bwd_current_alloc = torch.cuda.memory_allocated()
+                        _fwd_bwd_peak_alloc = torch.cuda.max_memory_allocated()
+                        print(
+                            f"[mem-debug] rank={self.rank} train fwd/bwd error: "
+                            f"allocated={_fwd_bwd_current_alloc / (1024**3):.1f}GiB "
+                            f"peak_allocated={_fwd_bwd_peak_alloc / (1024**3):.1f}GiB "
+                            f"transient_peak="
+                            f"{(_fwd_bwd_peak_alloc - _fwd_bwd_start_alloc) / (1024**3):.1f}GiB",
+                            flush=True,
+                        )
                         self.cuda_memory_profiler.dump_whole_run("training-error")
                         raise
 
