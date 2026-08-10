@@ -726,6 +726,9 @@ class MegatronPolicyWorkerImpl(
                             f"{(_fwd_bwd_peak_alloc - _fwd_bwd_start_alloc) / (1024**3):.1f}GiB",
                             flush=True,
                         )
+                        self.cuda_memory_profiler.dump_active_phase_on_error(
+                            "fwd-bwd-error"
+                        )
                         self.cuda_memory_profiler.dump_whole_run("training-error")
                         raise
 

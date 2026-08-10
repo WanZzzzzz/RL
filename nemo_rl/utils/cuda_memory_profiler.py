@@ -107,6 +107,52 @@ class CudaMemoryPhaseProfiler:
                 )
             self.history_active = False
 
+    def dump_active_phase_on_error(self, reason: str) -> Optional[Path]:
+        """Dump phase-scoped history after an error without CUDA synchronization."""
+        if (
+            not self.enabled
+            or self.whole_run
+            or not self.history_active
+            or self.active_phase is None
+        ):
+            return None
+
+        safe_role = self.role.replace("/", "_")
+        safe_reason = reason.replace("/", "_").replace(" ", "_")
+        occurrence = self.phase_counts[self.active_phase]
+        snapshot_path = self.output_dir / (
+            f"{safe_role}-{socket.gethostname()}-pid{os.getpid()}-rank{self.rank}-"
+            f"{self.active_phase}-{occurrence}-{safe_reason}-{time.time_ns()}.pickle"
+        )
+        try:
+            torch.cuda.memory._dump_snapshot(str(snapshot_path))
+            print(
+                f"[cuda-memory-phase-error] role={self.role} rank={self.rank} "
+                f"phase={self.active_phase} occurrence={occurrence} reason={reason} "
+                f"snapshot={snapshot_path}",
+                flush=True,
+            )
+            return snapshot_path
+        except Exception as exc:
+            print(
+                f"[cuda-memory-phase-error] role={self.role} rank={self.rank} "
+                f"phase={self.active_phase} occurrence={occurrence} reason={reason} "
+                f"snapshot_error={exc!r}",
+                flush=True,
+            )
+            return None
+        finally:
+            try:
+                torch.cuda.memory._record_memory_history(enabled=None)
+            except Exception as exc:
+                print(
+                    f"[cuda-memory-phase-error] role={self.role} rank={self.rank} "
+                    f"phase={self.active_phase} occurrence={occurrence} reason={reason} "
+                    f"history_stop_error={exc!r}",
+                    flush=True,
+                )
+            self.history_active = False
+
     def start(self, phase: str) -> None:
         if not self.enabled or not torch.cuda.is_available():
             return
