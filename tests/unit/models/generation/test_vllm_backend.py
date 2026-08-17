@@ -121,7 +121,9 @@ def _make_mtp_refit_extension(
     return ext, drafter_model
 
 
-def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
+def _make_unquantized_moe_model(
+    moe_backend: str, expert_placement_strategy: str = "linear"
+) -> SimpleNamespace:
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
         UnquantizedMoeBackend,
     )
@@ -131,7 +133,12 @@ def _make_unquantized_moe_model(moe_backend: str) -> SimpleNamespace:
 
     quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
     quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
-    module = SimpleNamespace(quant_method=quant_method)
+    module = SimpleNamespace(
+        quant_method=quant_method,
+        expert_map_manager=SimpleNamespace(
+            placement_strategy=expert_placement_strategy
+        ),
+    )
     return SimpleNamespace(modules=lambda: [module])
 
 @pytest.mark.vllm
@@ -248,6 +255,43 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     ]
     assert call_order == expected_cycle * 2
     ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypatch):
+    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = _DeferredReloadModel()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext.model_config = None
+    ext.device = torch.device("cpu")
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._validate_weight_update_compatibility = lambda _transport=None: None
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    transport_buffer = torch.empty(2)
+    record_metadata_for_reloading(model)
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        transport_buffer.copy_(torch.tensor([1.0, 2.0]))
+        ext._load_full_hf_weights([("layer.first", transport_buffer)])
+
+        transport_buffer.copy_(torch.tensor([7.0, 8.0]))
+        ext._load_full_hf_weights([("layer.second", transport_buffer)])
+        finalize()
+
+    torch.testing.assert_close(model.layer.first, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(model.layer.second, torch.tensor([7.0, 8.0]))
 
 
 @pytest.mark.vllm
@@ -418,6 +462,51 @@ def test_unquantized_reload_rejects_cotrained_mtp_during_prepare():
         ext.prepare_refit_info({"model.weight": object()})
 
     assert not hasattr(ext, "state_dict_info")
+
+
+@pytest.mark.vllm
+def test_unquantized_reload_rejects_round_robin_expert_placement_for_nccl_only():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM", "round_robin"),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+            parallel_config=SimpleNamespace(expert_placement_strategy="round_robin"),
+            quant_config=None,
+        ),
+    )
+    ext._mtp_drafter_refit_enabled = lambda: False
+
+    ext.prepare_refit_info({"model.weight": object()})
+
+    with pytest.raises(RuntimeError, match="linear expert placement"):
+        ext.prepare_nccl_reshard_refit_info({"layer_names": []})
+
+    assert hasattr(ext, "state_dict_info")
+    assert not hasattr(ext, "nccl_reshard_refit_info")
+
+
+@pytest.mark.vllm
+def test_unquantized_reload_uses_realized_expert_placement():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_unquantized_moe_model("FlashInfer TRTLLM", "linear"),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(expert_placement_strategy="round_robin"),
+            quant_config=None,
+        ),
+    )
+    ext._mtp_drafter_refit_enabled = lambda: False
+
+    ext._validate_weight_update_compatibility("nccl_reshard")
 
 
 @pytest.mark.vllm
