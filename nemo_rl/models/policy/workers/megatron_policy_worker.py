@@ -99,6 +99,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.utils.cuda_memory_profiler import CudaMemoryPhaseProfiler
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -403,6 +404,9 @@ class MegatronPolicyWorkerImpl(
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
+        self.cuda_memory_profiler = CudaMemoryPhaseProfiler(
+            role="megatron-policy", rank=self.rank
+        )
 
         # Step 1: Setup distributed
         setup_distributed()
@@ -1054,6 +1058,8 @@ class MegatronPolicyWorkerImpl(
             except Exception as e:
                 warnings.warn(f"Failed to compute FLOPs for MFU reporting: {e}")
         self.timer.stop("train")
+        if not eval_mode:
+            self.cuda_memory_profiler.stop("training")
         return metrics
 
     def _compute_moe_grad_scale(self, global_valid_toks):
@@ -2581,6 +2587,18 @@ class MegatronPolicyWorkerImpl(
 
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
+        """Profile and transfer weights through the NCCL reshard path."""
+        self.cuda_memory_profiler.start("refit")
+        try:
+            return self._nccl_reshard_refit_impl(kv_scales=kv_scales)
+        except BaseException:
+            self.cuda_memory_profiler.dump_active_phase_on_error("refit-error")
+            raise
+        finally:
+            self.cuda_memory_profiler.stop("refit")
+
+    @torch.no_grad()
+    def _nccl_reshard_refit_impl(self, kv_scales=None):
         """Transfer weights to generation workers via xferdtensor.
 
         Uses TP-local shards directly from Megatron parameters, bypassing
@@ -2677,6 +2695,7 @@ class MegatronPolicyWorkerImpl(
         )
 
     def prepare_for_lp_inference(self):
+        self.cuda_memory_profiler.start("logprob")
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
@@ -2699,6 +2718,8 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.empty_cache()
 
     def prepare_for_training(self, *args, **kwargs):
+        self.cuda_memory_profiler.stop("logprob")
+        self.cuda_memory_profiler.start("training")
         # onload models and optimizer state to cuda
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True

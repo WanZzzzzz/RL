@@ -32,6 +32,7 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
+from nemo_rl.utils.cuda_memory_profiler import CudaMemoryPhaseProfiler
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -184,6 +185,20 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+
+    def _cuda_memory_profiler(self) -> CudaMemoryPhaseProfiler:
+        profiler = getattr(self, "_nrl_cuda_memory_profiler", None)
+        if profiler is None:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            profiler = CudaMemoryPhaseProfiler(
+                role="vllm-generation", rank=rank, env_prefix="VLLM"
+            )
+            self._nrl_cuda_memory_profiler = profiler
+        return profiler
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -990,6 +1005,20 @@ class VllmInternalWorkerExtension:
         return mapping
 
     def nccl_reshard_refit(self) -> bool:
+        """Profile and receive weights through the NCCL reshard path."""
+        memory_profiler = self._cuda_memory_profiler()
+        memory_profiler.start("refit")
+        try:
+            result = self._nccl_reshard_refit_impl()
+        except BaseException:
+            memory_profiler.dump_active_phase_on_error("refit-error")
+            raise
+        finally:
+            memory_profiler.stop("refit")
+        memory_profiler.start("generation")
+        return result
+
+    def _nccl_reshard_refit_impl(self) -> bool:
         """Receive weights from training workers via xferdtensor.
 
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
