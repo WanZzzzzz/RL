@@ -63,7 +63,7 @@ except ImportError:
 apply_fp8_patches_from_env()
 
 
-WeightUpdateTransport = Literal["ipc", "collective"]
+WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
 WeightUpdateFinalizer = Callable[[], None]
 
 
