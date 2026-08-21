@@ -1298,7 +1298,6 @@ class VllmInternalWorkerExtension:
             raise
         finally:
             memory_profiler.stop("refit")
-        memory_profiler.start("generation")
         return result
 
     def _nccl_reshard_refit_impl(self, finalize: WeightUpdateFinalizer) -> bool:
