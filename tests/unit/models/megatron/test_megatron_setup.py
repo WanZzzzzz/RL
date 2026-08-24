@@ -1351,6 +1351,47 @@ class TestValidateOptimizerConfig:
 
 
 @pytest.mark.mcore
+class TestNormalizeOptimizerDtypes:
+    """Tests for optimizer dtype normalization at the MCore boundary."""
+
+    def test_normalizes_serialized_dtype_aliases(self):
+        from nemo_rl.models.megatron.setup import _normalize_optimizer_dtypes
+
+        config = {
+            "main_params_dtype": "fp32",
+            "main_grads_dtype": "bfloat16",
+            "exp_avg_dtype": "bf16",
+            "exp_avg_sq_dtype": "float16",
+            "lr": 1.0e-6,
+        }
+
+        normalized = _normalize_optimizer_dtypes(config)
+
+        assert normalized["main_params_dtype"] is torch.float32
+        assert normalized["main_grads_dtype"] is torch.bfloat16
+        assert normalized["exp_avg_dtype"] is torch.bfloat16
+        assert normalized["exp_avg_sq_dtype"] is torch.float16
+        assert normalized["lr"] == config["lr"]
+        assert config["main_params_dtype"] == "fp32"
+
+    def test_preserves_torch_dtypes(self):
+        from nemo_rl.models.megatron.setup import _normalize_optimizer_dtypes
+
+        config = {
+            "main_params_dtype": torch.float32,
+            "exp_avg_dtype": torch.bfloat16,
+        }
+
+        assert _normalize_optimizer_dtypes(config) == config
+
+    def test_rejects_unknown_dtype_name(self):
+        from nemo_rl.models.megatron.setup import _normalize_optimizer_dtypes
+
+        with pytest.raises(ValueError, match="Unsupported optimizer dtype"):
+            _normalize_optimizer_dtypes({"main_params_dtype": "float64"})
+
+
+@pytest.mark.mcore
 class TestValidateChunkingConfig:
     """Tests for _validate_chunking_config function."""
 

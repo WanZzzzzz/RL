@@ -1119,6 +1119,40 @@ def _validate_optimizer_config(config: PolicyConfig) -> None:
         )
 
 
+def _normalize_optimizer_dtypes(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Convert serialized dtype names to torch dtypes at the MCore boundary."""
+    normalized = dict(optimizer_cfg)
+    dtype_map = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "uint8": torch.uint8,
+        "fp8": torch.uint8,
+    }
+    dtype_keys = (
+        "main_params_dtype",
+        "main_grads_dtype",
+        "exp_avg_dtype",
+        "exp_avg_sq_dtype",
+    )
+    for key in dtype_keys:
+        value = normalized.get(key)
+        if not isinstance(value, str):
+            continue
+        try:
+            normalized[key] = dtype_map[value.lower()]
+        except KeyError as exc:
+            supported = ", ".join(sorted(dtype_map))
+            raise ValueError(
+                f"Unsupported optimizer dtype {value!r} for {key}; "
+                f"expected one of: {supported}"
+            ) from exc
+    return normalized
+
+
 def _validate_chunking_config(config: PolicyConfig) -> None:
     """Validate chunking configuration."""
     if (
@@ -1265,7 +1299,7 @@ def _create_megatron_config(
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
-        **config["megatron_cfg"]["optimizer"],
+        **_normalize_optimizer_dtypes(config["megatron_cfg"]["optimizer"]),
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
