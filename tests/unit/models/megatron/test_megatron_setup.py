@@ -913,6 +913,33 @@ class TestApplyPerformanceConfig:
         assert model_cfg.apply_rope_fusion is True
         assert model_cfg.bias_activation_fusion is True
 
+    def test_fine_grained_activation_offloading_config(self):
+        """Test forwarding fine-grained activation offloading settings to MCore."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": False,
+                "fine_grained_activation_offloading": True,
+                "offload_modules": ["expert_fc1"],
+                "min_offloaded_tensor_size": 2 * 1024 * 1024,
+                "fine_grained_offloading_max_inflight_offloads": 2,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.fine_grained_activation_offloading is True
+        assert model_cfg.offload_modules == ["expert_fc1"]
+        assert model_cfg.min_offloaded_tensor_size == 2 * 1024 * 1024
+        assert model_cfg.fine_grained_offloading_max_inflight_offloads == 2
+
     def test_activation_checkpointing_enabled(self):
         """Test activation checkpointing configuration."""
         from nemo_rl.models.megatron.setup import _apply_performance_config

@@ -747,15 +747,32 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
 
+    # Fine-grained activation offloading
+    megatron_cfg = config["megatron_cfg"]
+    if "fine_grained_activation_offloading" in megatron_cfg:
+        model_cfg.fine_grained_activation_offloading = megatron_cfg[
+            "fine_grained_activation_offloading"
+        ]
+    if "offload_modules" in megatron_cfg:
+        model_cfg.offload_modules = megatron_cfg["offload_modules"]
+    if "min_offloaded_tensor_size" in megatron_cfg:
+        model_cfg.min_offloaded_tensor_size = megatron_cfg[
+            "min_offloaded_tensor_size"
+        ]
+    if "fine_grained_offloading_max_inflight_offloads" in megatron_cfg:
+        model_cfg.fine_grained_offloading_max_inflight_offloads = megatron_cfg[
+            "fine_grained_offloading_max_inflight_offloads"
+        ]
+
     # Activation checkpointing
-    if config["megatron_cfg"]["activation_checkpointing"]:
-        granularity = config["megatron_cfg"].get("recompute_granularity", "full")
+    if megatron_cfg["activation_checkpointing"]:
+        granularity = megatron_cfg.get("recompute_granularity", "full")
         model_cfg.recompute_granularity = granularity
         if granularity == "full":
             model_cfg.recompute_method = "uniform"
             model_cfg.recompute_num_layers = 1
         elif granularity == "selective":
-            recompute_modules = config["megatron_cfg"].get("recompute_modules")
+            recompute_modules = megatron_cfg.get("recompute_modules")
             if recompute_modules is not None:
                 # NOTE: MCore validates recompute_modules in TransformerConfig.__post_init__,
                 # but that validation doesn't re-run after attribute assignment here.

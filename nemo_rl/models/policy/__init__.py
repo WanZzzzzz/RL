@@ -254,6 +254,14 @@ class MegatronConfig(TypedDict):
     # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
     # when None. Use ["moe"] to recompute only expert activations (production-proven config).
     recompute_modules: NotRequired[list[str] | None]
+    # Module-level CPU activation offloading. Requires Transformer Engine and,
+    # with TE >= 2.10, NVTE_CPU_OFFLOAD_V1=1 in env_vars.
+    fine_grained_activation_offloading: NotRequired[bool]
+    # MCore valid options include attention boundaries and the MoE-specific
+    # "expert_fc1" and "moe_act" boundaries.
+    offload_modules: NotRequired[list[str] | None]
+    min_offloaded_tensor_size: NotRequired[int]
+    fine_grained_offloading_max_inflight_offloads: NotRequired[int | None]
     tensor_model_parallel_size: int
     pipeline_model_parallel_size: int
     num_layers_in_first_pipeline_stage: int | None
